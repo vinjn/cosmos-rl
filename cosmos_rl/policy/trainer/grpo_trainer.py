@@ -50,7 +50,6 @@ from cosmos_rl.utils.util import (
 )
 from cosmos_rl.utils.parallelism_map import (
     ParallelTopoMapperGroup,
-    slice_tensor_with_strategies,
 )
 from functools import cached_property
 from typing import List, Callable, Dict, Any, Tuple, Optional
@@ -58,10 +57,8 @@ import types
 from functools import partial
 import msgpack
 from cosmos_rl.utils.network_util import make_request_with_retry
-from cosmos_rl.utils.ulysses import (
-    slice_input_for_ulysses,
-)
-from cosmos_rl.utils.util import is_master_rank, seperate_nccl_comm_needed
+from cosmos_rl.utils.ulysses import slice_input_for_ulysses
+from cosmos_rl.utils.util import is_master_rank
 from cosmos_rl.utils import constant
 from cosmos_rl.utils.distributed import HighAvailabilitylNccl
 from cosmos_rl.dispatcher.replica import Rollout
@@ -265,11 +262,11 @@ class GRPOTrainer(Trainer):
                 self.fetch_command_thread.join()
                 self.fetch_command_thread = None
 
-            if self.heartbeat_thread is not None:
+            if hasattr(self, "heartbeat_thread") and self.heartbeat_thread is not None:
                 self.heartbeat_thread.join()
                 self.heartbeat_thread = None
 
-            if self.upload_thread is not None:
+            if hasattr(self, "upload_thread") and self.upload_thread is not None:
                 logger.info("[Policy] Waiting for upload thread to finish...")
                 self.upload_thread.join()
                 logger.info("[Policy] Upload thread finished.")
@@ -549,25 +546,15 @@ class GRPOTrainer(Trainer):
         and replacing certain substrings in the parameter names.
         """
         name_to_transform = {}
-        assert len(self.model.sorted_params) > 0, "No sorted parameters found."
-        for info in self.model.weight_sync_transforms:
-            name, shape, transform_block = info
-            # Condition is relaxed from shape matching to number of elements matching because the tensor may be transposed/reshaped
-            if isinstance(transform_block, Callable):
-                mapped_tensor = transform_block()
-            elif isinstance(transform_block, torch.Tensor):
-                mapped_tensor = transform_block
-            else:
-                raise ValueError(
-                    f"Transform block is not a callable or tensor: {transform_block}"
-                )
-            assert (
-                mapped_tensor.nelement() == int(np.prod(shape))
-            ), f"Number of elements mismatch: {mapped_tensor.nelement()} != {np.prod(shape)} for {name}"
+        assert len(self.model.sorted_hf_key_n_rank) > 0, "No sorted parameters found."
+        for name, transform_block in self.model.weight_sync_transforms:
+            assert isinstance(transform_block, Callable) or isinstance(
+                transform_block, torch.Tensor
+            )
             name_to_transform[name] = transform_block
         return name_to_transform
 
-    def precollect_parameters_for_sync(self):
+    def pre_P2R_collect_parameters(self):
         needed_tensors = []
         for inst in self.policy_to_rollout_insts:
             dest_name = inst[3]
@@ -576,7 +563,9 @@ class GRPOTrainer(Trainer):
         for dest_name, local_view in self.map_w_from_policy_to_rollout.items():
             if isinstance(
                 local_view, Callable
-            ) and self.model.tensor_precollect_required_for_sync(dest_name):
+            ) and self.model.weight_mapper.policy_pre_P2R_gather_required_for_sync(
+                dest_name
+            ):
                 view = local_view()
                 if dest_name in needed_tensors:
                     prepared_tensor_to_rollout[dest_name] = view
@@ -584,8 +573,6 @@ class GRPOTrainer(Trainer):
 
     @Trainer.register_policy_command_handler(PolicyToRolloutUnicastCommand)
     def execute_policy_to_rollout_unicast(self, command: PolicyToRolloutUnicastCommand):
-        need_sep_comm = seperate_nccl_comm_needed()
-
         assert command.src_replica_size == self.world_size
         if self.parallel_mapper is None:
             self.parallel_mapper = ParallelTopoMapperGroup(
@@ -593,39 +580,41 @@ class GRPOTrainer(Trainer):
                 self.config.rollout.parallelism,
                 self.world_size,
                 command.dst_replica_size,
-                self.hf_config,
-                self.config.policy.model_name_or_path,
+                hf_config=self.hf_config,
+                weight_mapper=self.model.weight_mapper,
             )
-        send = command.src_replica_name == self.replica_name
-        if not send:
+        if not command.src_replica_name == self.replica_name:
+            logger.error(
+                f"Policy {self.replica_name} received P2R command from {command.src_replica_name}, but it is not the source replica."
+            )
             return False
 
         if self.policy_to_rollout_insts is None:
-            param = self.model.sorted_params
-            insts = self.parallel_mapper.generate_policy_to_rollout_insts(
-                param, self.global_rank
+            # Ordered list of (hf_key, tensor_dim)
+            hf_key_n_rank: List[Tuple[str, int]] = self.model.sorted_hf_key_n_rank
+            self.policy_to_rollout_insts = (
+                self.parallel_mapper.prepare_policy_to_rollout_manifest(
+                    hf_key_n_rank, self.global_rank
+                )
             )
-            self.policy_to_rollout_insts = insts
             self.p2r_related_ranks = [set() for _ in range(command.src_replica_size)]
             for rank in range(command.src_replica_size):
-                insts_at_rank = self.parallel_mapper.generate_policy_to_rollout_insts(
-                    param, rank
+                insts_at_rank = self.parallel_mapper.prepare_policy_to_rollout_manifest(
+                    hf_key_n_rank, rank
                 )
                 for i in insts_at_rank:
                     p_rank, r_rank, _, _, _ = i
                     self.p2r_related_ranks[rank].add(r_rank)
 
         comm_id = {}
+        # Create nccl id for one policy replica to another rollout replica
         for p_rank in range(command.src_replica_size):
             for r_rank in sorted(self.p2r_related_ranks[p_rank]):
                 mesh_key = command.src_replica_name + "_" + command.dst_replica_name
-                if need_sep_comm:
-                    mesh_key += f"_{p_rank}_{r_rank}"
 
                 if mesh_key not in self.p2r_nccl_uuids:
                     nccl_uuid = None
                     if self.global_rank == 0:
-                        # initialize nccl handle for building mesh among policies
                         # Only create nccl group id in rank 0.
                         nccl_uuid = create_nccl_uid()
                         base64_nccl_group_id = list_to_b64(nccl_uuid)
@@ -654,8 +643,6 @@ class GRPOTrainer(Trainer):
 
         for r_rank in sorted(self.p2r_related_ranks[self.global_rank]):
             mesh_key = command.src_replica_name + "_" + command.dst_replica_name
-            if need_sep_comm:
-                mesh_key += f"_{self.global_rank}_{r_rank}"
             if mesh_key not in self.rollouts_comm:
                 assert mesh_key in self.p2r_nccl_uuids
                 nccl_uuid = self.p2r_nccl_uuids[mesh_key]
@@ -664,10 +651,8 @@ class GRPOTrainer(Trainer):
                 )
                 comm_id[r_rank] = create_nccl_comm(
                     nccl_uuid,
-                    0 if need_sep_comm else self.global_rank,
-                    2
-                    if need_sep_comm
-                    else (self.world_size + command.dst_replica_size),
+                    self.global_rank,
+                    self.world_size + command.dst_replica_size,
                 )
                 logger.debug(
                     f"[Policy] `P2R` nccl comm: {comm_id[r_rank]} for `P2R` with mesh_key: {mesh_key} is created."
@@ -678,24 +663,6 @@ class GRPOTrainer(Trainer):
         assert (
             self.map_w_from_policy_to_rollout is not None
         ), "No parameters to sync found."
-        # Check the model parameters for sync consistency
-        # This is a sanity check to make sure the model parameters are consistent
-        # Commenting out for now, since it is time consuming and not necessary
-        # for name, shape in self.model.sorted_params():
-        #     local_view = self.model.weight_sync_transform_by_key(name)
-        #     sync_view = self.get_parameter_to_sync(name)
-        #     assert local_view.data_ptr() == sync_view.data_ptr(), (
-        #         f"Data pointer mismatch: {local_view.data_ptr()} != {sync_view.data_ptr()} for {name}"
-        #     )
-        #     assert local_view.shape == shape, (
-        #         f"Shape mismatch: {local_view.shape} != {shape} for {name}"
-        #     )
-        #     assert sync_view.shape == shape, (
-        #         f"Shape mismatch: {sync_view.shape} != {shape} for {name}"
-        #     )
-        #     assert local_view.dtype == sync_view.dtype, (
-        #         f"Data type mismatch: {local_view.dtype} != {sync_view.dtype} for {name}"
-        #     )
         st = time.time()
         # sort the param list by the dest_name, same as rollout
         total_bytes_sent = 0
@@ -703,30 +670,30 @@ class GRPOTrainer(Trainer):
         # Here we use another comm to send weight to rollout
         # NCCL announces that multi-comm could lead to deadlocks if not synchronized
         with torch.cuda.stream(self.train_stream):
-            prepared_tensors_to_rollout = self.precollect_parameters_for_sync()
+            pre_P2R_collected_tensors: Dict[str, torch.Tensor] = (
+                self.pre_P2R_collect_parameters()
+            )
             for inst in self.policy_to_rollout_insts:
-                p_rank, r_rank, tensor_split_strategys, dest_name, shape = inst
+                p_rank, r_rank, tensor_split_strategys, dest_name, _ = inst
                 if dest_name not in self.map_w_from_policy_to_rollout:
-                    raise Exception(
-                        f"[Policy] {dest_name} not in map_w_from_policy_to_rollout. Please call execute_policy_to_rollout_unicast_preparation first."
+                    raise RuntimeError(
+                        f"dest_name {dest_name} not in map_w_from_policy_to_rollout"
                     )
                 local_view = self.map_w_from_policy_to_rollout[dest_name]
-                if dest_name in prepared_tensors_to_rollout:
-                    local_view = prepared_tensors_to_rollout[dest_name]
+                if dest_name in pre_P2R_collected_tensors:
+                    local_view = pre_P2R_collected_tensors[dest_name]
                 elif isinstance(local_view, Callable):
                     local_view = local_view()
-                assert (
-                    local_view.nelement() == int(np.prod(shape))
-                ), f"Number of elements mismatch: {local_view.nelement()} != {np.prod(shape)} for {dest_name}"
+                else:
+                    pass
+
                 view = (
-                    slice_tensor_with_strategies(local_view, tensor_split_strategys)
-                    .contiguous()
-                    .cuda()
+                    local_view.cosmos_slice(tensor_split_strategys).contiguous().cuda()
                 )
                 assert self.global_rank == p_rank
                 nccl_send(
                     view,
-                    1 if need_sep_comm else (self.world_size + r_rank),
+                    self.world_size + r_rank,
                     comm_id[r_rank],
                 )
                 total_bytes_sent += view.numel() * view.element_size()
@@ -808,7 +775,7 @@ class GRPOTrainer(Trainer):
             )
 
         # Train ACK
-        if is_master_rank(self.parallel_dims, self.global_rank) and not is_fake_step:
+        if is_master_rank(self.parallel_dims, self.global_rank):
             try:
                 make_request_with_retry(
                     partial(
@@ -816,6 +783,7 @@ class GRPOTrainer(Trainer):
                         json={
                             "replica_name": self.replica_name,
                             "weight_step": command.global_step,
+                            "total_steps": command.total_steps,
                             "profile_finished": self.profiler.check_finished(),
                             "report_data": report_data,
                         },

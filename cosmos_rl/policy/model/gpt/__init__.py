@@ -35,9 +35,6 @@ from cosmos_rl.utils.parallelism import ParallelDims
 from cosmos_rl.policy.config import Config as CosmosConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from functools import cached_property
-from cosmos_rl.dispatcher.data.packer.decoder_only_llm_data_packer import (
-    DecoderOnlyLLMDataPacker,
-)
 from flash_attn import flash_attn_func
 
 
@@ -366,7 +363,7 @@ class GPTBlock(nn.Module):
         return out
 
 
-class GPT(nn.Module, BaseModel):
+class GPT(BaseModel):
     """
     GPT Module
 
@@ -388,7 +385,8 @@ class GPT(nn.Module, BaseModel):
         return ["llama", "qwen2", "qwen3"]
 
     def __init__(self, model_args: GPTArgs):
-        super().__init__()
+        super().__init__(model_args.hf_config)
+
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
         self.n_layers = model_args.n_layers
@@ -639,23 +637,16 @@ class GPT(nn.Module, BaseModel):
         local_view = target_tensor.to_local() if is_dist_tensor else target_tensor
         return local_view
 
-    def weight_sync_transform_by_key(
-        self, dest_name: str
-    ) -> Union[Callable[[], torch.Tensor], torch.Tensor]:
-        self_state_dict = self.state_dict()
-        self_state_dict = {clear_weight_name(k): v for k, v in self_state_dict.items()}
-        return self.weight_sync_transform_by_key_internal(dest_name, self_state_dict)
-
     @cached_property
-    def weight_sync_transforms(self) -> List[Tuple[str, Tuple[int], torch.Tensor]]:
+    def weight_sync_transforms(self) -> List[Tuple[str, Union[torch.Tensor, Callable]]]:
         self_state_dict = self.state_dict()
         self_state_dict = {clear_weight_name(k): v for k, v in self_state_dict.items()}
         transforms = []
-        for dest_name, shape in self.sorted_params:
+        for dest_name, _ in self.sorted_hf_key_n_rank:
             local_view = self.weight_sync_transform_by_key_internal(
                 dest_name, self_state_dict
             )
-            transforms.append((dest_name, shape, local_view))
+            transforms.append((dest_name, local_view))
         return transforms
 
     @classmethod
@@ -735,18 +726,6 @@ class GPT(nn.Module, BaseModel):
             )
         )
         return model
-
-    @classmethod
-    def map_local_key_to_hf_key(cls, name: str) -> str:
-        name = clear_weight_name(name)
-        if not name == "lm_head.weight":
-            if not name.startswith("model."):
-                name = "model." + name
-        return name
-
-    @classmethod
-    def data_packer(cls) -> DecoderOnlyLLMDataPacker:
-        return DecoderOnlyLLMDataPacker()
 
     @classmethod
     def fqn_filter_for_fp8(cls) -> List[str]:

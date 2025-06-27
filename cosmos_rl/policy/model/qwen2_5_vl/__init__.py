@@ -36,9 +36,6 @@ from cosmos_rl.policy.model.qwen2_5_vl.weight_converter import (
 from cosmos_rl.utils.parallelism import ParallelDims
 from cosmos_rl.policy.config import Config as CosmosConfig
 from cosmos_rl.policy.model.base import BaseModel
-from cosmos_rl.dispatcher.data.packer.qwen2_5_vlm_data_packer import (
-    Qwen2_5_VLM_DataPacker,
-)
 from functools import cached_property
 import re
 from functools import partial
@@ -847,10 +844,9 @@ class Qwen2_5_VLModel(nn.Module):
         )
 
 
-class Qwen2_5_VLConditionalModel(nn.Module, BaseModel):
-    def __init__(self, config):
-        super().__init__()
-        # save the config into a toml file
+class Qwen2_5_VLConditionalModel(BaseModel):
+    def __init__(self, config: Qwen2_5_VL_LM_Args):
+        super().__init__(config.hf_config)
         self.config = config
         self.visual = Qwen2_5_VisionTransformerPretrainedModel(config.encoder_args)
         self.model = Qwen2_5_VLModel(config.lm_args)
@@ -1493,24 +1489,8 @@ class Qwen2_5_VLConditionalModel(nn.Module, BaseModel):
         local_view = target_tensor.to_local() if is_dist_tensor else target_tensor
         return local_view
 
-    def weight_sync_transform_by_key(
-        self, dest_name: str
-    ) -> Union[Callable[[], torch.Tensor], torch.Tensor]:
-        lm_state_dict = self.model.state_dict()
-        if self.visual is not None:
-            visual_state_dict = self.visual.state_dict()
-        else:
-            visual_state_dict = {}
-        lm_state_dict = {clear_weight_name(k): v for k, v in lm_state_dict.items()}
-        visual_state_dict = {
-            clear_weight_name(k): v for k, v in visual_state_dict.items()
-        }
-        return self.weight_sync_transform_by_key_internal(
-            dest_name, lm_state_dict, visual_state_dict
-        )
-
     @cached_property
-    def weight_sync_transforms(self) -> List[Tuple[str, Tuple[int], torch.Tensor]]:
+    def weight_sync_transforms(self) -> List[Tuple[str, Union[torch.Tensor, Callable]]]:
         lm_state_dict = self.model.state_dict()
         if self.visual is not None:
             visual_state_dict = self.visual.state_dict()
@@ -1521,32 +1501,18 @@ class Qwen2_5_VLConditionalModel(nn.Module, BaseModel):
             clear_weight_name(k): v for k, v in visual_state_dict.items()
         }
         transforms = []
-        for dest_name, shape in self.sorted_params:
+        for dest_name, _ in self.sorted_hf_key_n_rank:
             local_view = self.weight_sync_transform_by_key_internal(
                 dest_name, lm_state_dict, visual_state_dict
             )
-            transforms.append((dest_name, shape, local_view))
+            transforms.append((dest_name, local_view))
         return transforms
 
-    @classmethod
-    def map_local_key_to_hf_key(cls, name: str) -> str:
-        name = clear_weight_name(name)
-        if name.startswith("language_model."):
-            name = name.replace("language_model.", "")
-        if name == "model.lm_head.weight":
-            name = "lm_head.weight"
-        return name
-
     @cached_property
-    def sorted_params(self) -> List[Tuple[str, Tuple[int]]]:
-        """
-        Returns the state dict of the model and visual model, along with the sorted parameters information.
-        The sorted parameters information is a list of tuples, where each tuple contains the parameter name and its shape.
-        The state dicts are obtained from the model and visual model respectively.
-        """
-        sorted_params_info = []
+    def sorted_hf_key_n_rank(self) -> List[Tuple[str, int]]:
+        sorted_key_n_rank = []
         for k, v in self.named_parameters():
-            k = self.map_local_key_to_hf_key(k)
+            k = self.weight_mapper.policy_map_local_key_to_hf_key(k)
             is_dist_tensor = isinstance(v, torch.distributed.tensor.DTensor)
             if k.startswith("visual.") and "qkv" in k:
                 # For visual model, we need to split qkv weights
@@ -1555,37 +1521,14 @@ class Qwen2_5_VLConditionalModel(nn.Module, BaseModel):
                 q_view = local_view[:unit_dim]
                 k_view = local_view[unit_dim : 2 * unit_dim]
                 v_view = local_view[2 * unit_dim :]
-                sorted_params_info.append((k.replace("qkv", "q"), q_view.shape))
-                sorted_params_info.append((k.replace("qkv", "k"), k_view.shape))
-                sorted_params_info.append((k.replace("qkv", "v"), v_view.shape))
+                sorted_key_n_rank.append((k.replace("qkv", "q"), q_view.ndim))
+                sorted_key_n_rank.append((k.replace("qkv", "k"), k_view.ndim))
+                sorted_key_n_rank.append((k.replace("qkv", "v"), v_view.ndim))
             else:
                 local_view = v.to_local() if is_dist_tensor else v
-                sorted_params_info.append((k, local_view.shape))
-        sorted_params_info.sort(key=lambda x: x[0])
-        return sorted_params_info
-
-    def tensor_precollect_required_for_sync(self, name: str) -> bool:
-        """
-        Check if the tensor sync precollect is required for the given name.
-        Args:
-            name (str): The name of the tensor.
-        Returns:
-            bool: True if the tensor sync precollect is required, False otherwise.
-        """
-        is_visual = name.startswith("visual.")
-        # Handle qkv weights for separate q, k, v tensors
-        if (
-            match := re.search(  # noqa: F841
-                r"blocks\.(\d+)\.attn\.(q|k|v)\.(weight|bias)",
-                name,
-            )
-        ) is not None and is_visual:
-            return True
-        return False
-
-    @classmethod
-    def data_packer(cls) -> Qwen2_5_VLM_DataPacker:
-        return Qwen2_5_VLM_DataPacker()
+                sorted_key_n_rank.append((k, local_view.ndim))
+        sorted_key_n_rank.sort(key=lambda x: x[0])
+        return sorted_key_n_rank
 
     @classmethod
     def fqn_filter_for_fp8(cls) -> List[str]:

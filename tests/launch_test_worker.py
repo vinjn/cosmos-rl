@@ -21,7 +21,8 @@ from multiprocessing import shared_memory
 import numpy as np
 import torch.distributed as dist
 import toml
-
+from transformers import AutoConfig
+from typing import Tuple, Dict, Any
 
 import threading
 from cosmos_rl.policy.trainer.grpo_trainer import GRPOTrainer
@@ -64,7 +65,7 @@ class TestModel:
     num_hidden_layers = 16
 
     def __init__(self, device, parallel_dims):
-        self.sorted_params = [
+        self.sorted_hf_key_n_rank = [
             ("model.layers.9.input_layernorm.weight", torch.Size([1024])),
             ("model.layers.9.mlp.down_proj.weight", torch.Size([1024, 11008])),
             ("model.layers.9.mlp.gate_proj.weight", torch.Size([5504, 2048])),
@@ -81,7 +82,9 @@ class TestModel:
             ("model.norm.weight", torch.Size([1024])),
             ("model.embed_tokens.weight", torch.Size([75968, 2048])),
         ]
-        self.sorted_params.sort(key=lambda x: x[0])
+        self.sorted_hf_key_n_rank.sort(key=lambda x: x[0])
+
+        self.config = AutoConfig.from_pretrained(self.model_path)
         self.device = device
         self.parallel_dims = parallel_dims
         self.tensors = [
@@ -92,7 +95,7 @@ class TestModel:
                 .to(self.device)
                 * 0.001,
             )
-            for k, v in self.sorted_params
+            for k, v in self.sorted_hf_key_n_rank
         ]
         self.sharded_tensors = {}
         for k, v in self.tensors:
@@ -100,7 +103,7 @@ class TestModel:
                 v, k, self.model_type, self.parallel_dims
             )[1]
         self.sorted_sharded_params = [
-            (k, self.sharded_tensors[k].shape) for k, _ in self.sorted_params
+            (k, self.sharded_tensors[k].ndim) for k, _ in self.sorted_hf_key_n_rank
         ]
 
 
@@ -127,21 +130,20 @@ class TestPolicy:
             rollout_parallelism_config,
             policy_world_size,
             rollout_world_size,
-            self.model,
-            self.model.model_path,
+            self.model.config,
         )
         self.replica_name = name
         self.rollouts_comm = rollouts_comm
         self.policy_to_rollout_insts = None
         self.map_w_from_policy_to_rollout = self.model.sharded_tensors
-        self.model.sorted_params = self.model.sorted_sharded_params
+        self.model.sorted_hf_key_n_rank = self.model.sorted_sharded_params
         self.p2r_nccl_uuids = rollouts_comm
         self.train_stream = torch.cuda.Stream()
 
     def execute_policy_to_rollout_unicast(self, command: PolicyToRolloutUnicastCommand):
         pass
 
-    def precollect_parameters_for_sync(self):
+    def pre_P2R_collect_parameters(self):
         return {}
 
 
@@ -170,8 +172,7 @@ class TestRollout:
             rollout_parallelism_config,
             policy_world_size,
             rollout_world_size,
-            self.model,
-            self.model.model_path,
+            self.model.config,
         )
         self.weight_mapper = self.parallel_mapper.weight_mapper
         compatibale_map = self.model.sharded_tensors
@@ -182,17 +183,62 @@ class TestRollout:
         }
         self.ref_compatibale_map = compatibale_map
 
-        def custom_generate_compatible_map(self, model):
-            self.compatible_weight_map = compatibale_map
-            self.compatible_list = compatibale_list
+        def rollout_prepare_recv(self, vllm_model):
+            self.vllm_weight_inplace_view_map = compatibale_map
+            self.recv_key_n_rank_list = compatibale_list
             return operate_compatibale_map, compatibale_list
 
         self.operate_compatibale_map = operate_compatibale_map
-        self.weight_mapper.generate_compatible_map = types.MethodType(
-            custom_generate_compatible_map, self.weight_mapper
+        self.weight_mapper.rollout_prepare_recv = types.MethodType(
+            rollout_prepare_recv, self.weight_mapper
         )
         self.inference_stream = torch.cuda.Stream()
         self.state = vLLMRolloutWorker.State()
+
+    def recv_weight_shard(
+        self,
+        global_rank_of_rollout: int,
+        manifest: Tuple[int, int, Dict[int, Any], str, Tuple[int]],
+        communicator_index: Dict[int, int],
+        do_weight_sync_check: bool = False,
+    ):
+        p_rank, r_rank, tensor_split_strategys, dest_name, _ = manifest
+        assert r_rank == global_rank_of_rollout
+
+        target_tensor = self.vllm_weight_inplace_view_map[dest_name]
+
+        view = target_tensor.cosmos_slice(tensor_split_strategys)
+
+        if do_weight_sync_check:
+            cloned_target_tensor = target_tensor.clone()
+            # clear the current view
+            view.zero_()
+
+        recv_tensor = None
+        if view.is_contiguous():
+            recv_tensor = view
+        else:
+            # new a temp tensor
+            recv_tensor = torch.empty_like(view)
+
+        nccl_recv(recv_tensor, p_rank, communicator_index[p_rank])
+
+        # inplace copy
+        if not view.is_contiguous():
+            view.copy_(recv_tensor)
+
+        if do_weight_sync_check:
+            # If the weight sync between Policy and Rollout is correct, the
+            # `target_tensor` would have no change.
+            # TODO: (lms) When we support quantization in rollout side,
+            # we should handle the numerical error of quantized weight, not
+            # just apply `torch.allclose` simply.
+            if not torch.allclose(cloned_target_tensor, target_tensor):
+                raise ValueError(
+                    f"Weight sync check failed after weight sync instruction: {manifest}"
+                )
+
+        return recv_tensor.numel() * recv_tensor.element_size()
 
     def get_underlying_model(self):
         return None
