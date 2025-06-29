@@ -30,7 +30,7 @@ import asyncio
 from functools import wraps
 from msgpack import ExtType
 from tqdm import tqdm
-from typing import List
+from typing import List, Tuple
 import torch
 import pynvml
 from contextlib import contextmanager
@@ -972,3 +972,43 @@ def create_async_task(coro):
     strong_refs.add(task)
     task.add_done_callback(strong_refs.discard)
     return task
+
+
+def compute_logprobs(
+    input_ids_batch: torch.Tensor,  # [batch_size, max_len]
+    logprob_masks: torch.Tensor,  # [batch_size, max_len],
+    full_logits: torch.Tensor,  # [batch_size, max_len, vocab_size]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute the per-token log probabilities and advantages
+
+    Args:
+        minibatch: a dictionary containing the input_ids and logprob_masks
+        full_logits: the logits of the model
+
+    Returns:
+        logps: the per-token log probabilities
+        cu_seqlens: the cumulative sequence lengths of the logps
+    """
+    # Shift token_ids
+    shifted_input_ids = torch.empty_like(input_ids_batch)
+    shifted_input_ids[:, :-1] = input_ids_batch[:, 1:]
+    shifted_input_ids[:, -1] = 0
+    assert (
+        full_logits.shape[:2] == shifted_input_ids.shape[:2]
+    ), f"Logits shape {full_logits.shape} does not match input_ids shape {shifted_input_ids.shape}"
+    bsz, _, _ = full_logits.shape
+    # select the effective logits
+    effective_logits = torch.gather(
+        full_logits,
+    )  # [n_logprob_tokens, vocab_size]
+    effective_input_ids = shifted_input_ids[logprob_masks]  # [n_logprob_tokens,]
+    masked_seqlens = logprob_masks.sum(dim=-1)  # [bsz,]
+    cu_seqlens = torch.zeros(
+        bsz + 1, dtype=torch.int32, device=full_logits.device
+    )  # [bsz + 1,]
+    cu_seqlens[1:] = torch.cumsum(masked_seqlens, dim=0)
+    logps = selective_log_softmax(
+        effective_logits, effective_input_ids
+    )  # [n_logprob_tokens,]
+    return logps, cu_seqlens

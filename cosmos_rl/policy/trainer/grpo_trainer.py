@@ -46,7 +46,6 @@ from cosmos_rl.utils.util import (
     msgpack_c_long,
     msgunpack_c_long,
     fix_data_type_size,
-    masked_mean,
 )
 from cosmos_rl.utils.parallelism_map import (
     ParallelTopoMapperGroup,
@@ -66,24 +65,28 @@ from cosmos_rl.utils.api_suffix import (
     COSMOS_API_NCCL_COMM_INITIATOR_SUFFIX,
     COSMOS_API_POLICY_TRAIN_ACK_SUFFIX,
 )
-from cosmos_rl.utils.util import selective_log_softmax
 from cosmos_rl.utils.pynccl import (
     create_nccl_uid,
     create_nccl_comm,
     nccl_send,
 )
+from cosmos_rl.utils.util import compute_logprobs as logprobs_computing
 
 
 def compute_loss(
-    current_token_logps: torch.Tensor,  # per-token logprobs of shape `[batch_size, max_len]`
-    old_per_token_logps: torch.Tensor,  # per-token logprobs of shape `[batch_size, max_len]`
+    current_token_logps: torch.Tensor,  # per-token logprobs of shape `[n_tokens_of_logprobs]`
+    old_per_token_logps: torch.Tensor,  # per-token logprobs of shape `[n_tokens_of_logprobs]`
     ref_per_token_logps: Optional[
         torch.Tensor
-    ],  # per-token logprobs of shape `[batch_size, max_len]`
+    ],  # per-token logprobs of shape `[n_tokens_of_logprobs]`
     current_advantages: torch.Tensor,  # of shape `[batch_size, max_len]`
+    cu_seqlens: torch.Tensor,  # of shape `[batch_size + 1]`
     config: CosmosConfig,
     logprob_masks: torch.Tensor,  # of shape `[batch_size, max_len]`
 ) -> torch.Tensor:
+    # Turn current_advantages from [batch_size, max_len] to [n_logprob_tokens]
+    current_advantages = torch.masked_select(current_advantages, logprob_masks)
+
     assert (
         current_token_logps.shape == current_advantages.shape
     ), "current_token_logps and current_advantages should have the same shape"
@@ -119,7 +122,7 @@ def compute_loss(
     if config.train.train_policy.aipo_rho is not None:
         # Due to the asynchronous update of the reference model, the rollout is not necessarily
         # the exact previous iterate of latest policy. So a more natural motivation is correct
-        # for the off-policyness of samples generated under previous policy, to contruct
+        # for the off-policyness of samples generated under previous policy, to construct
         # approximate on-policy update to latest policy.
         # A difference from double-sided clipping of PPO, we use one-sided clipping.
         rho = config.train.train_policy.aipo_rho
@@ -149,11 +152,22 @@ def compute_loss(
     else:
         kl_loss = torch.zeros_like(per_token_loss)
 
+    bsz, max_len = logprob_masks.shape
+    per_token_loss_seq_sum = torch.zeros(
+        bsz, device=per_token_loss.device, dtype=per_token_loss.dtype
+    )  # [bsz,]
+    kl_loss_seq_sum = torch.zeros(
+        bsz, device=kl_loss.device, dtype=kl_loss.dtype
+    )  # [bsz,]
+    for i in range(bsz):
+        per_token_loss_seq_sum[i] = per_token_loss[
+            cu_seqlens[i] : cu_seqlens[i + 1]
+        ].sum()
+        kl_loss_seq_sum[i] = kl_loss[cu_seqlens[i] : cu_seqlens[i + 1]].sum()
+    shifted_length = cu_seqlens[1:] - cu_seqlens[:-1]
+
     if config.train.train_policy.loss_type == "seq-mean-token-mean":
         # seq-mean-token-sum
-        per_token_loss = (per_token_loss * logprob_masks).sum(dim=-1)
-        kl_loss = (kl_loss * logprob_masks).sum(dim=-1)
-
         # If Dr.GRPO is used, we need to normalize the loss by the max tokens for unbiased loss
         if (
             config.train.train_policy.unbiased_loss_max_tokens is not None
@@ -161,20 +175,20 @@ def compute_loss(
         ):
             norm_factor = config.train.train_policy.unbiased_loss_max_tokens
         else:
-            norm_factor = per_token_loss.shape[-1]
+            norm_factor = max_len
 
-        per_token_loss = (per_token_loss / norm_factor).mean()
-        kl_loss = (kl_loss / norm_factor).mean()
+        per_token_loss = (per_token_loss_seq_sum / norm_factor).mean()
+        kl_loss = (kl_loss_seq_sum / norm_factor).mean()
         return per_token_loss, kl_loss
     elif config.train.train_policy.loss_type == "seq-mean-token-sum":
         # seq-mean-token-sum
-        per_token_loss = (per_token_loss * logprob_masks).sum(dim=-1)
-        kl_loss = (kl_loss * logprob_masks).sum(dim=-1)
+        per_token_loss = per_token_loss_seq_sum / max_len
+        kl_loss = kl_loss_seq_sum / max_len
         return per_token_loss.mean(), kl_loss.mean()
     elif config.train.train_policy.loss_type == "token-mean":
         # token-mean
-        per_token_loss = masked_mean(per_token_loss, logprob_masks)
-        kl_loss = masked_mean(kl_loss, logprob_masks)
+        per_token_loss = per_token_loss_seq_sum / shifted_length
+        kl_loss = kl_loss_seq_sum / shifted_length
         return per_token_loss.mean(), kl_loss.mean()
     else:
         raise ValueError(f"Invalid loss type: {config.train.train_policy.loss_type}")
@@ -1000,28 +1014,22 @@ class GRPOTrainer(Trainer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the per-token log probabilities and advantages
+
+        Args:
+            minibatch: a dictionary containing the input_ids and logprob_masks
+            full_logits: the logits of the model
+
+        Returns:
+            logps: the per-token log probabilities
+            logprob_masks: the logprob_masks
         """
         assert "input_ids" in minibatch, "input_ids is required for computing logprobs"
         assert (
             "logprob_masks" in minibatch
         ), "logprob_masks is required for computing logprobs"
-        # [batch_size, max_len]
-        input_ids_batch = minibatch["input_ids"]
-        # [batch_size, max_len]
-        logprob_masks = minibatch["logprob_masks"]
-
-        # [batch_size, max_len]
-        # advantages_of_interest = advantages * logprob_masks
-
-        # Shift token_ids
-        shifted_input_ids = torch.empty_like(input_ids_batch)
-        shifted_input_ids[:, :-1] = input_ids_batch[:, 1:]
-        shifted_input_ids[:, -1] = 0
-        assert (
-            full_logits.shape[:2] == shifted_input_ids.shape[:2]
-        ), f"Logits shape {full_logits.shape} does not match input_ids shape {shifted_input_ids.shape}"
-        logps = selective_log_softmax(full_logits, shifted_input_ids) * logprob_masks
-        return logps, logprob_masks
+        return logprobs_computing(
+            minibatch["input_ids"], minibatch["logprob_masks"], full_logits
+        )
 
     def _swap_model_state_dict(self):
         kl_beta = self.config.train.train_policy.kl_beta
@@ -1312,13 +1320,16 @@ class GRPOTrainer(Trainer):
                                         raw_logits
                                         / self.config.train.train_policy.temperature
                                     )
-
-                                current_per_token_logprobs, logprob_masks = (
+                                # returned shape:
+                                # current_per_token_logprobs: [n_tokens_of_logprobs]
+                                # cu_seqlens: [batch_size + 1]
+                                current_per_token_logprobs, cu_seqlens = (
                                     self.compute_logprobs(
                                         user_mini_batch,
                                         full_logits=raw_logits,
                                     )
                                 )
+                                logprob_masks = user_mini_batch["logprob_masks"]
                                 current_advantages = (
                                     logprob_masks * minibatched_advantages
                                 )
@@ -1355,6 +1366,7 @@ class GRPOTrainer(Trainer):
                                         self.old_per_token_logps[local_mini_step],
                                         self.ref_per_token_logps[local_mini_step],
                                         current_advantages,
+                                        cu_seqlens,
                                         self.config,
                                         logprob_masks,
                                     )
@@ -1537,12 +1549,13 @@ def _swizzle_pp_grpo_forward(
     if config.train.train_policy.temperature > 1e-6:
         raw_logits = raw_logits / config.train.train_policy.temperature
     # [n_tokens, n_vocab]
-    current_per_token_logprobs, logprob_masks = trainer.compute_logprobs(
+    current_per_token_logprobs, cu_seqlens = trainer.compute_logprobs(
         minibatch={
             **user_input,
         },
         full_logits=raw_logits,
     )
+    logprob_masks = user_input["logprob_masks"]
     current_advantages = logprob_masks * advantages
 
     if is_computing_ref:
@@ -1567,8 +1580,8 @@ def _swizzle_pp_grpo_forward(
         ]
         assert isinstance(old_per_token_logprobs, torch.Tensor)
         assert (
-            old_per_token_logprobs.ndim == 2
-        ), f"old_per_token_logprobs.ndim: {old_per_token_logprobs.ndim}, while it should be 2"
+            old_per_token_logprobs.ndim == 1
+        ), f"old_per_token_logprobs.ndim: {old_per_token_logprobs.ndim}, while it should be 1"
         assert (
             old_per_token_logprobs.shape == current_per_token_logprobs.shape
         ), f"old_per_token_logprobs.shape: {old_per_token_logprobs.shape}, while it should be {current_per_token_logprobs.shape}"
@@ -1589,8 +1602,8 @@ def _swizzle_pp_grpo_forward(
             micro_batch_id
         ]
         assert (
-            ref_per_token_logprobs.ndim == 2
-        ), f"ref_per_token_logprobs.ndim: {ref_per_token_logprobs.ndim}, while it should be 2"
+            ref_per_token_logprobs.ndim == 1
+        ), f"ref_per_token_logprobs.ndim: {ref_per_token_logprobs.ndim}, while it should be 1"
         assert (
             ref_per_token_logprobs.shape == current_per_token_logprobs.shape
         ), f"ref_per_token_logprobs.shape: {ref_per_token_logprobs.shape}, while it should be {current_per_token_logprobs.shape}"
@@ -1600,6 +1613,7 @@ def _swizzle_pp_grpo_forward(
         old_per_token_logprobs,
         ref_per_token_logprobs,
         current_advantages,
+        cu_seqlens,
         config,
         logprob_masks,
     )
