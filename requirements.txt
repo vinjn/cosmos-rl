@@ -1,7 +1,7 @@
 cmake
 fastapi
 uvicorn
-transformers>=4.51.1,!=4.52.*
+transformers>=4.51.1,!=4.52.*,!=4.53.* # 4.53.* error: https://github.com/vllm-project/vllm-ascend/pull/1482, 4.52.* warning: https://github.com/huggingface/transformers/pull/38366
 datasets
 pydantic
 math_verify
