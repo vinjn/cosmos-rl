@@ -100,7 +100,7 @@ def run_train():
         )
 
     cosmos_config = PolicyConfig.from_dict(metadata["config"])
-    logger.info(f"[Policy] Loaded configuration: {cosmos_config.key_values()}")
+    logger.info(f"[Policy] Loaded configuration: {cosmos_config.model_dump()}")
 
     parallel_dims = ParallelDims.from_config(
         parallesim_config=cosmos_config.policy.parallelism

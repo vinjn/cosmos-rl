@@ -49,7 +49,7 @@ def run_rollout():
         sys.exit(0)
 
     logger.info(
-        f"[Rollout] Loaded rollout configuration: {cosmos_rollout_config.rollout.key_values()}"
+        f"[Rollout] Loaded rollout configuration: {cosmos_rollout_config.rollout.model_dump()}"
     )
 
     parallel_dims = ParallelDims.from_config(
