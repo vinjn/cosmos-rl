@@ -97,7 +97,6 @@ class Controller:
         reward_fns: Optional[List[Callable]] = None,
         data_packer: Optional[DataPacker] = None,
         val_dataset: Optional[Dataset] = None,
-        val_reward_fns: Optional[List[Callable]] = None,
         val_data_packer: Optional[DataPacker] = None,
     ):
         if self.config is not None:
@@ -120,13 +119,18 @@ class Controller:
             )
 
         self.is_rl = task_type != "sft"
+
+        if dataset is not None and isinstance(dataset, Callable):
+            dataset = dataset(config)
+        if val_dataset is not None and isinstance(val_dataset, Callable):
+            val_dataset = val_dataset(config)
+
         self.sft_user_dataset = dataset if not self.is_rl else None
         self.user_data_packer = data_packer
         self.user_val_data_packer = val_data_packer
         self.dataset = None
         if self.is_rl:
             if dataset is not None:
-                # Do simple sanity check
                 assert isinstance(dataset, Dataset)
                 self.dataset = CosmosDataset(
                     config=config, train_set=dataset, tokenizer=self.tokenizer
@@ -157,7 +161,6 @@ class Controller:
 
             if config.train.enable_validation:
                 if val_dataset is not None:
-                    # Do simple sanity check
                     assert isinstance(val_dataset, Dataset)
                     self.val_dataset = CosmosValidationDataset(
                         config=config, val_set=val_dataset, tokenizer=self.tokenizer
