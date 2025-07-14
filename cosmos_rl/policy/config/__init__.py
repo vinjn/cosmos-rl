@@ -370,6 +370,10 @@ class ProfilerConfig(BaseModel):
         default=False,
         description="Enable profiler for training",
     )
+    enable_nsys: bool = Field(
+        default=False,
+        description="Enable nsys for training",
+    )    
     sub_profiler_config: SubProfilerConfig = Field(
         default_factory=SubProfilerConfig, description="Sub profiler config"
     )
