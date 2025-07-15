@@ -12,7 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+#
+# This file is from https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/fused_a2a.py
+# Licensed under https://github.com/NVIDIA/Megatron-LM/blob/main/LICENSE
+#
 # Portions of this code are from DeepSeek DeepEP project
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
