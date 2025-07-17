@@ -30,7 +30,6 @@ from cosmos_rl.utils import constant
 
 
 class CosmosProfiler:
-
     def __init__(
         self,
         config: CosmosConfig,
