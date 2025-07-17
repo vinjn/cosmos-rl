@@ -425,13 +425,13 @@ class SFTTrainer(Trainer):
                 ):
                     if (
                         self.train_step
-                        == self.profiler.WAIT_STEPS + self.profiler.WARMUP_STEPS
+                        == self.profiler.wait_steps + self.profiler.warmup_steps
                     ):
                         torch.cuda.cudart().cudaProfilerStart()
                     elif (
                         self.train_step
-                        == self.profiler.WAIT_STEPS
-                        + self.profiler.WARMUP_STEPS
+                        == self.profiler.wait_steps
+                        + self.profiler.warmup_steps
                         + self.profiler.active_steps
                     ):
                         torch.cuda.cudart().cudaProfilerStop()
