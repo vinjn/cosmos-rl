@@ -393,8 +393,9 @@ class PolicyStatusManager:
 
     def trigger_rebuild_mesh(self, valid_replicas: List[Replica]):
         # Always tell the policy to rebuild mesh even there is only one policy replica
+        sorted_valid_replicas = sorted(valid_replicas, key=lambda x: x.start_time)
         command.BuildMeshCommand.trigger(
-            valid_replicas, redis_handler=self.redis_handler
+            sorted_valid_replicas, redis_handler=self.redis_handler
         )
         self.recompute_total_steps()
 
@@ -998,8 +999,9 @@ class RolloutStatusManager:
         self,
         valid_replicas: List[Replica],
     ):
+        sorted_valid_replicas = sorted(valid_replicas, key=lambda x: x.start_time)
         command.BuildMeshCommand.trigger(
-            valid_replicas, redis_handler=self.redis_handler
+            sorted_valid_replicas, redis_handler=self.redis_handler
         )
 
     def post_register_hook(
