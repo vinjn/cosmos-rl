@@ -3,6 +3,7 @@ redis = "12808"
 [train]
 resume = false
 epoch = 1
+max_num_steps = 10
 output_dir = "./outputs/qwen3-moe-30b-tp8-sft"
 epsilon = 1e-6
 optm_name = "AdamW"
@@ -15,10 +16,11 @@ optm_grad_norm_clip = 1.0
 async_tp_enabled = false
 compile = false
 param_dtype = "bfloat16"
+master_dtype = "bfloat16"
 fsdp_reduce_dtype = "float32"
 fsdp_offload = false
 fsdp_reshard_after_forward = "default"
-train_batch_per_replica = 32
+train_batch_per_replica = 2
 sync_weight_interval = 1
 
 [policy]
@@ -40,7 +42,7 @@ conversation_column_name = "conversation"
 mini_batch = 2
 
 [train.ckpt]
-enable_checkpoint = true
+enable_checkpoint = false
 save_freq = 2000
 save_mode = "async"
 
@@ -48,18 +50,19 @@ save_mode = "async"
 n_init_replicas = 1
 tp_size = 4
 cp_size = 1
-dp_shard_size = 1
+dp_shard_size = 2
 pp_size = 1
 dp_replicate_size = 1
+enable_deep_ep = false
 
 [profiler]
 enable_profiler = true
 enable_nsys = false
 
 [profiler.sub_profiler_config]
-active_steps = 1
-rank_filter = [0,1,2,3,4,5,6,7]
+active_steps = 3
+rank_filter = [0]
 record_shape = true
 profile_memory = false
-with_stack = true
+with_stack = false
 with_modules = true
