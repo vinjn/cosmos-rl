@@ -785,12 +785,10 @@ class Qwen3MoE(BaseModel):
         # so we need to delete it manually
         self.rotary_emb.to(torch.cuda.current_device())
         self.rotary_emb.reset_inv_freq()
-        # Basically, max_seq_len * 2 is enough for all-to-all-v communication.
-        overflow = 2
 
-        self.enable_deep_ep = cosmos_config.train.enable_deep_ep
-        if self.enable_deep_ep:
-            self.ep_size = cosmos_config.train.ep_size
+        FeedForward.enable_deep_ep = cosmos_config.policy.parallelism.enable_deep_ep
+        if FeedForward.enable_deep_ep:
+            self.ep_size = cosmos_config.policy.parallelism.ep_size
             ep_mesh = None  # TODO(jing) find a way to get ep_mesh
             ep_rank = ep_mesh.get_local_rank()
 
@@ -808,13 +806,16 @@ class Qwen3MoE(BaseModel):
                 local_expert_indices_offset + i for i in range(num_local_experts)
             ]
 
-            self.token_dispatcher = MoEFlexTokenDispatcher(
+            FeedForward.token_dispatcher = MoEFlexTokenDispatcher(
                 num_local_experts=num_local_experts,
                 local_expert_indices=local_expert_indices,
                 config=config,
                 ep_group=self.ep_group,
             )
         else:
+            # Basically, max_seq_len * 2 is enough for all-to-all-v communication.
+            overflow = 2
+
             # TODO(cjx): max_seq_len * mini_batch is a better choice
             MAX_BATCH_MUL_SEQ_LEN = (
                 self.model_args.max_seq_len
